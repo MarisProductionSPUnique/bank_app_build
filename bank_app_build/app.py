@@ -11,7 +11,7 @@ from decimal import Decimal, InvalidOperation
 
 import click
 from dotenv import load_dotenv
-from flask import Flask, g, jsonify, render_template, request, session
+from flask import Flask, Response, g, jsonify, render_template, request, session
 from sqlalchemy import (BigInteger, Boolean, CheckConstraint, Column, DateTime,
                         ForeignKey, Integer, String, UniqueConstraint, create_engine,
                         or_, select, text)
@@ -19,6 +19,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import declarative_base, sessionmaker
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
 load_dotenv()
 Base = declarative_base()
@@ -96,6 +97,13 @@ def create_app(config=None):
     engine = create_engine(url, pool_pre_ping=True, connect_args={'connect_timeout': 5}, hide_parameters=True)
     DB = sessionmaker(engine, expire_on_commit=False)
     app.extensions.update(bank_engine=engine, bank_db=DB)
+    http_requests = Counter('bank_http_requests_total', 'Total HTTP requests', ['method', 'path', 'status'])
+    http_duration = Histogram('bank_http_request_duration_seconds', 'HTTP request duration in seconds', ['method', 'path'])
+    login_total = Counter('bank_login_total', 'Bank login attempts', ['result'])
+    transfer_total = Counter('bank_transfer_total', 'Bank transfer attempts', ['result'])
+    database_errors = Counter('bank_database_errors_total', 'Database errors observed by the application')
+    app_errors = Counter('bank_application_errors_total', 'Unhandled application errors')
+
     logger = logging.getLogger('bank')
     logger.setLevel(logging.INFO)
     if not logger.handlers:
@@ -146,13 +154,17 @@ def create_app(config=None):
         response.headers['Content-Security-Policy'] = "default-src 'self'; style-src 'self'; script-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         if not request.path.startswith('/static/'):
             response.headers['Cache-Control'] = 'no-store'
+        duration = time.monotonic() - g.started
+        http_requests.labels(request.method, request.path, str(response.status_code)).inc()
+        http_duration.labels(request.method, request.path).observe(duration)
         event('request_completed', method=request.method, path=request.path,
-              status=response.status_code, duration_ms=round((time.monotonic()-g.started)*1000, 1))
+              status=response.status_code, duration_ms=round(duration*1000, 1))
         return response
 
     @app.errorhandler(SQLAlchemyError)
     def database_error(exc):
         # Do not log SQL parameters, connection URLs or exception strings.
+        database_errors.inc()
         event('database_error', exception_type=type(exc).__name__)
         return fail('Database operation unavailable; check application logs', 503)
 
@@ -160,6 +172,7 @@ def create_app(config=None):
     def unexpected(exc):
         if isinstance(exc, HTTPException):
             return fail(exc.name, exc.code)
+        app_errors.inc()
         event('application_error', exception_type=type(exc).__name__, traceback=traceback.format_tb(exc.__traceback__))
         return fail('Application error; trace the request ID in logs', 500)
 
@@ -196,6 +209,7 @@ def create_app(config=None):
                     user.login_failures += 1
                     if user.login_failures >= 10:
                         user.locked_until = now + timedelta(minutes=10)
+                login_total.labels('rejected').inc()
                 event('login_rejected')
                 return fail('Incorrect username or password', 401)
             user.login_failures = 0
@@ -203,6 +217,7 @@ def create_app(config=None):
             session.clear()
             session.update(user_id=user.id, csrf=secrets.token_urlsafe(32))
             session.permanent = True
+            login_total.labels('succeeded').inc()
             event('login_succeeded', user_id=user.id)
             return jsonify(csrf=session['csrf'], user=dict(name=user.username, trainer=user.trainer))
 
@@ -270,6 +285,7 @@ def create_app(config=None):
                     return fail('This retry key was already used for different payment details', 409)
                 return jsonify(transfer_id=previous.id, message='Existing transfer returned; no second debit', replay=True)
             if sender.balance < amount:
+                transfer_total.labels('rejected').inc()
                 event('transfer_rejected', reason='insufficient_funds')
                 return fail('Insufficient balance', 409)
             event('transfer_started', sender_id=sender.id, receiver_id=recipient.id)
@@ -280,6 +296,7 @@ def create_app(config=None):
             db.flush()
             db.add_all([Ledger(transfer_id=tid, account_id=sender.id, amount=-amount),
                         Ledger(transfer_id=tid, account_id=recipient.id, amount=amount)])
+        transfer_total.labels('succeeded').inc()
         event('transfer_committed', transfer_id=tid)
         return jsonify(transfer_id=tid, message='Demo transfer completed', replay=False), 201
 
@@ -291,6 +308,10 @@ def create_app(config=None):
             rows = db.scalars(select(Transfer).where(or_(Transfer.sender == a.id, Transfer.receiver == a.id)).order_by(Transfer.created.desc()).limit(100)).all()
             return jsonify(transactions=[dict(id=t.id, amount=money(t.amount), direction='Debit' if t.sender == a.id else 'Credit',
                 created=t.created.isoformat(), status='Completed', request_id=t.request_id) for t in rows])
+
+    @app.get('/metrics')
+    def metrics():
+        return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
 
     @app.get('/health/live')
     def live():
