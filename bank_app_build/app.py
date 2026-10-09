@@ -20,7 +20,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import declarative_base, sessionmaker
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, Counter, Gauge, Histogram, generate_latest
+from prometheus_client.core import CounterMetricFamily
 
 load_dotenv()
 Base = declarative_base()
@@ -79,6 +80,22 @@ def money(paise):
     return f'{Decimal(paise) / 100:.2f}'
 
 
+class ProcessIOCollector:
+    """Expose Linux process read/write I/O counters at scrape time."""
+
+    def collect(self):
+        try:
+            with open('/proc/self/io', encoding='utf-8') as handle:
+                counters = dict(line.strip().split(':', 1) for line in handle if ':' in line)
+            read_bytes = int(counters['read_bytes'])
+            write_bytes = int(counters['write_bytes'])
+        except (OSError, ValueError, KeyError):
+            return
+
+        yield CounterMetricFamily('bank_process_read_bytes', 'Bytes read by application process from storage', value=read_bytes)
+        yield CounterMetricFamily('bank_process_write_bytes', 'Bytes written by application process to storage', value=write_bytes)
+
+
 def create_app(config=None):
     app = Flask(__name__)
     app.config.update(SECRET_KEY=os.getenv('SECRET_KEY'),
@@ -112,6 +129,7 @@ def create_app(config=None):
     disk_total.set_function(lambda: shutil.disk_usage('/').total)
     disk_used.set_function(lambda: shutil.disk_usage('/').used)
     disk_free.set_function(lambda: shutil.disk_usage('/').free)
+    REGISTRY.register(ProcessIOCollector())
 
     logger = logging.getLogger('bank')
     logger.setLevel(logging.INFO)
