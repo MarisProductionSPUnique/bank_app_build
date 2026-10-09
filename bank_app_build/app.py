@@ -134,6 +134,14 @@ def create_app(config=None):
     disk_used.set_function(lambda: shutil.disk_usage('/').used)
     disk_free.set_function(lambda: shutil.disk_usage('/').free)
     REGISTRY.register(ProcessIOCollector())
+    # Linux load averages visible to this application. On Render these may
+    # describe the underlying host rather than an isolated service quota.
+    load1 = Gauge('bank_system_load1', 'Application-visible system load average over 1 minute')
+    load5 = Gauge('bank_system_load5', 'Application-visible system load average over 5 minutes')
+    load15 = Gauge('bank_system_load15', 'Application-visible system load average over 15 minutes')
+    load1.set_function(lambda: os.getloadavg()[0])
+    load5.set_function(lambda: os.getloadavg()[1])
+    load15.set_function(lambda: os.getloadavg()[2])
     process_count = Gauge('bank_visible_process_count', 'Process count visible in application PID namespace')
     def visible_process_count():
         try:
