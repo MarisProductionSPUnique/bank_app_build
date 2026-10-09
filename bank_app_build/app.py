@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import time
 import traceback
 import uuid
@@ -19,7 +20,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import declarative_base, sessionmaker
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 load_dotenv()
 Base = declarative_base()
@@ -103,6 +104,14 @@ def create_app(config=None):
     transfer_total = Counter('bank_transfer_total', 'Bank transfer attempts', ['result'])
     database_errors = Counter('bank_database_errors_total', 'Database errors observed by the application')
     app_errors = Counter('bank_application_errors_total', 'Unhandled application errors')
+    # Filesystem visible to this app process (not the Render service disk quota).
+    # These callback gauges are refreshed when the /metrics endpoint is scraped.
+    disk_total = Gauge('bank_disk_total_bytes', 'Total application-visible filesystem capacity in bytes')
+    disk_used = Gauge('bank_disk_used_bytes', 'Used application-visible filesystem space in bytes')
+    disk_free = Gauge('bank_disk_free_bytes', 'Available application-visible filesystem space in bytes')
+    disk_total.set_function(lambda: shutil.disk_usage('/').total)
+    disk_used.set_function(lambda: shutil.disk_usage('/').used)
+    disk_free.set_function(lambda: shutil.disk_usage('/').free)
 
     logger = logging.getLogger('bank')
     logger.setLevel(logging.INFO)
