@@ -121,6 +121,10 @@ def create_app(config=None):
     transfer_total = Counter('bank_transfer_total', 'Bank transfer attempts', ['result'])
     database_errors = Counter('bank_database_errors_total', 'Database errors observed by the application')
     app_errors = Counter('bank_application_errors_total', 'Unhandled application errors')
+    # Application HTTP payload counters; these are not network-interface metrics.
+    http_in_bytes = Counter('bank_http_request_body_bytes_total', 'Known HTTP request body bytes received')
+    http_out_bytes = Counter('bank_http_response_body_bytes_total', 'Known HTTP response body bytes sent')
+    http_5xx = Counter('bank_http_server_errors_total', 'HTTP 5xx response count (not network packet errors)')
     # Filesystem visible to this app process (not the Render service disk quota).
     # These callback gauges are refreshed when the /metrics endpoint is scraped.
     disk_total = Gauge('bank_disk_total_bytes', 'Total application-visible filesystem capacity in bytes')
@@ -130,6 +134,13 @@ def create_app(config=None):
     disk_used.set_function(lambda: shutil.disk_usage('/').used)
     disk_free.set_function(lambda: shutil.disk_usage('/').free)
     REGISTRY.register(ProcessIOCollector())
+    process_count = Gauge('bank_visible_process_count', 'Process count visible in application PID namespace')
+    def visible_process_count():
+        try:
+            return sum(entry.isdigit() for entry in os.listdir('/proc'))
+        except OSError:
+            return float('nan')
+    process_count.set_function(visible_process_count)
 
     logger = logging.getLogger('bank')
     logger.setLevel(logging.INFO)
@@ -184,6 +195,14 @@ def create_app(config=None):
         duration = time.monotonic() - g.started
         http_requests.labels(request.method, request.path, str(response.status_code)).inc()
         http_duration.labels(request.method, request.path).observe(duration)
+        # Omit unknown lengths; don't buffer request/response payloads to measure them.
+        if request.content_length is not None and request.content_length >= 0:
+            http_in_bytes.inc(request.content_length)
+        response_size = response.calculate_content_length()
+        if response_size is not None and response_size >= 0:
+            http_out_bytes.inc(response_size)
+        if 500 <= response.status_code < 600:
+            http_5xx.inc()
         event('request_completed', method=request.method, path=request.path,
               status=response.status_code, duration_ms=round(duration*1000, 1))
         return response
